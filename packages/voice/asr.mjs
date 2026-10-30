@@ -33,8 +33,10 @@ export const ASR_DEFAULTS = {
   rule2MinTrailingSilence: 1.2,
   // 规则 3：单句最长 15s，防止有人一直说导致内存和延迟爬升
   rule3MinUtteranceLength: 15,
-  // 收尾补的静音：直接截断时模型会吞掉最后一个字（实测），补 0.4s 稳定
-  tailPaddingSec: 0.4,
+  // 收尾补的静音：**必须 ≥ 一个分块**，否则最后一块永远凑不满、不解码，尾字就丢了。
+  // 这套模型分块 480ms（7680 采样），原来补 0.4s（6400 采样）差一点，实测
+  // 「放一首周杰伦的晴天」→「放一首周杰伦的」、「任务管理器」掉「器」。0.7s 留余量。
+  tailPaddingSec: 0.7,
   hotwordsFile: '',
   hotwordsScore: 1.5,
 }
