@@ -130,8 +130,6 @@ let tray = null
 let hideTimer = null
 /** 用户是否亲手收起过小窗（决定"自动隐藏后要不要再弹出来"） */
 let userDismissedHud = false
-/** 保存设置后的短暂静默期：点击声容易被 KWS 当成唤醒词 */
-let wakeMutedUntil = 0
 
 let lastShowMode = null
 let currentState = 'hidden'
@@ -287,17 +285,6 @@ function requestShow(mode, state, retry) {
   if (!contentReady || !windowReady) {
     pendingShow = { mode, state, retry }
     // 兜底：某些环境下 ready-to-show 可能迟迟不来，不能让"唤醒"被卡住
-    setTimeout(() => {
-      if (contentReady && windowReady) return
-      contentReady = true
-      windowReady = true
-      if (pendingShow !== null) {
-        const { mode: m, state: s } = pendingShow
-        pendingShow = null
-        log('show fallback: ready signal missing')
-        doShow(target, m, s)
-      }
-    }, 800)
     return target
   }
   doShow(target, mode, state)
@@ -305,20 +292,6 @@ function requestShow(mode, state, retry) {
 }
 
 function doShow(target, mode, state) {
-  // 诊断用：任何一次 HUD 显示都记下触发栈（CUA_VA_TRACE_SHOW=1 时更详细）
-  try {
-    const frames = String(new Error().stack ?? '').split('\n').slice(2, 6).map((line) => line.trim()).join(' <- ')
-    log(`doShow(state=${state}, mode=${mode}, settingsOpen=${settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible()}) <- ${frames}`)
-  } catch { /* 记录失败不影响显示 */ }
-  /*
-   * 改设置的时候一律不弹 HUD。
-   * 之前点"保存"会让助手从内部冒出来（不是唤醒词，是某条内部调用链触发的显示），
-   * 与其一条条追，不如在这里立一条规矩：设置窗口开着，谁也别想弹窗。
-   */
-  if (process.env.CUA_VA_SUPPRESS_SHOW !== '0' && settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible()) {
-    log(`show suppressed（设置在开，state=${state}）: ${new Error().stack?.split('\n').slice(2, 4).join(' | ') ?? ''}`)
-    return
-  }
   userDismissedHud = false
   positionBottomRight(target)
   if (mode === 'showInactive') target.showInactive()
@@ -524,15 +497,6 @@ async function stopListening() {  if (!listening) return { ok: true, already: tr
 
 /** 唤醒命中：弹出小窗并进入"说指令"阶段 */
 function onWake(keyword) {
-  /*
-   * 设置窗口在前台时不响应唤醒词。
-   * 用户点"保存"、敲键盘时，KWS 很容易被点击声/人声误触发，
-   * 表现出来就是"一保存助手就醒了"——它是被声音叫醒的，不是被保存叫醒的。
-   */
-if ((settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible())
-    || (wakeMutedUntil > 0 && Date.now() < wakeMutedUntil)) {
-    return
-  }
   log(`wake: ${keyword}`)
   // 一次唤醒 = 一次会话：清掉上一件事的记忆，避免"新问题被老问题带偏"
   resetSession('wake')
@@ -1369,10 +1333,22 @@ function processChunk(chunk) {
   if (result.levelDb > micStats.peakLevelDb) micStats.peakLevelDb = result.levelDb
   micStats.floorDb = result.floorDb
 
-  if (result.wake !== null && !selfSpeaking() && Date.now() - lastWakeAt > 2000) {
-    lastWakeAt = Date.now()
-    micStats.wakes += 1
-    onWake(result.wake)
+  if (result.wake !== null) {
+    /*
+     * 门有两个：播报中（含播完 600ms 冷静期）、2 秒冷却。
+     * 被挡住必须留痕——之前挡住时什么都不记，日志上分不清
+     * "KWS 根本没检出"和"检出了但被拦"，排查唤醒失效时全靠猜。
+     */
+    const blockedBy = selfSpeaking()
+      ? 'self-speaking'
+      : (Date.now() - lastWakeAt <= 2000 ? 'cooldown' : null)
+    if (blockedBy !== null) {
+      log(`wake detected but blocked: ${blockedBy}（queue=${ttsQueue.length} pumping=${ttsPumping} lastSpoken=${Date.now() - lastSpokenEndAt}ms ago）`)
+    } else {
+      lastWakeAt = Date.now()
+      micStats.wakes += 1
+      onWake(result.wake)
+    }
   }
 
   // 指令识别：只在这轮唤醒的有效期内跑，静默时不占 CPU
@@ -1404,7 +1380,7 @@ function processChunk(chunk) {
   }
   // 每 2 秒记一行电平，便于排查"为什么没触发"
   if (micStats.chunks % 20 === 0) {
-    log(`level=${result.levelDb} floor=${result.floorDb} speech=${result.speech} gain=${result.gainDb}`)
+    log(`level=${result.levelDb} floor=${result.floorDb} speech=${result.speech} gain=${result.gainDb} tts=${selfSpeaking() ? 1 : 0}`)
   }
 }
 
@@ -2346,6 +2322,11 @@ function registerSettingsIpc() {
         }
       }
       // 音乐不需要凭据：LX 自己管账号，这里不再做任何同步
+      /*
+       * 落盘必须保留：上一版清理凭据同步时把这一行一起误删了，
+       * 结果保存永远 "saved is not defined"，配置根本没写进文件。
+       */
+      const saved = await store.saveConfig(next)
 
       // 立刻生效（不用重启）——这些都是内存里的开关与默认值
       if (typeof payload?.ui?.ttsEnabled === 'boolean') ttsEnabled = payload.ui.ttsEnabled
@@ -2436,10 +2417,6 @@ function registerSettingsIpc() {
     }
   })
 
-  /*
-   * 网易云登录：CLI 会给出一个一次性登录链接（手机扫码/网页授权）。
-   * 用户点设置里的「登录网易云」→ 我们取链接并丢给系统浏览器打开。
-   */
   /* 音乐改用 LX 之后不需要登录：LX 自己管音源账号。这里只留一个"LX 在不在"的检查。 */
   ipcMain.handle('settings:lxStatus', async () => {
     const available = await lxAvailable()
@@ -2451,6 +2428,9 @@ function registerSettingsIpc() {
       return { ok: false, error: error.message }
     }
   })
+
+  /* 导出审计日志：上一版清理网易云登录块时把它一起删掉了，设置页"导出全部"会报 No handler */
+  ipcMain.handle('settings:exportAudit', async () => exportAudit())
 
   ipcMain.handle('settings:testVoice', async (_event, options) => {
     try {
@@ -2733,24 +2713,11 @@ async function saveWakePreference(enabled) {
 // ---------------------------------------------------------------- 生命周期
 
 // 单实例：托盘应用开两份会让用户看到两个图标、抢同一套热键
-/** 父进程是谁（把我们拉起来的那个）：用来查谁在偷偷启动第二个实例 */
-function describeParentProcess() {
-  try {
-    const result = spawnSync('powershell.exe', ['-NoProfile', '-Command',
-      `(Get-CimInstance Win32_Process -Filter "ProcessId=${process.ppid}" | Select-Object -ExpandProperty Name)`],
-      { encoding: 'utf8', windowsHide: true, timeout: 4000 })
-    const name = String(result.stdout ?? '').trim()
-    return `${name === '' ? '?' : name}(ppid=${process.ppid})`
-  } catch {
-    return `?(ppid=${process.ppid})`
-  }
-}
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 log(`singleInstanceLock=${gotSingleInstanceLock}`)
 if (!gotSingleInstanceLock) {
   // 记下是谁把我们拉起来的：'second-instance' 的窗口是它弹的
-  log(`second-instance launch：parent=${describeParentProcess()} argv=${process.argv.slice(1).join(' ')}`)
   app.quit()
 } else {
   /*
@@ -2763,15 +2730,8 @@ if (!gotSingleInstanceLock) {
    * 看起来就是"助手被唤醒了"。谁在拉起我们暂时不知道，所以先把父进程记下来。
    * 另外：设置窗口开着就不弹，别打断改配置。
    */
-  app.on('second-instance', () => {
-    const parent = describeParentProcess()
-    log(`second-instance：又被拉起一次（parent=${parent}）`)
-    if (settingsWin !== null && !settingsWin.isDestroyed() && settingsWin.isVisible()) {
-      log('second-instance：设置在开，不弹窗')
-      return
-    }
-    showForInteraction('listening')
-  })
+  /* 第二个实例被拉起时，主实例负责把它叫到前台（原本就是这么写的，没有别的分支） */
+  app.on('second-instance', () => showForInteraction('listening'))
   app.whenReady().then(async () => {
   log('whenReady')
   /*

@@ -119,11 +119,34 @@ export function schemeUrl(path, params = {}) {
 /**
  * 按"歌名 歌手"搜索并播放。
  * 走 music/searchPlay：LX 会自己挑音源、自己取流、自己播。
+ *
+ * 三个坑都在这儿处理（都是实测出来的）：
+ *   1. LX 没开时先等它的开放 API 就绪，否则 scheme 会被启动过程吃掉（日志里那次 8 秒超时）；
+ *   2. 成功判定不能用"在播放"——上一首还在放的时候它立刻成立，会拿旧歌名当成功；
+ *      改成"歌名变了"或"从暂停变成播放"；
+ *   3. 超时从 8 秒收到 4 秒：歌名对的时候 1~2 秒就换好了，等更久基本是搜不到。
  */
 export async function playByKeyword(keyword) {
   const text = String(keyword ?? '').trim()
   if (text === '') throw new Error('要播放什么？给我个歌名')
-  // name-singer 形式；用户说"晴天 周杰伦"时拆成 名字-歌手 更准
+
+  // ① LX 没开就先拉起来，等 /status 能应答再发 scheme
+  if (!(await lxAvailable())) {
+    if (!launchLx()) {
+      throw new Error('LX Music 没在运行，也没找到它的安装路径；先手动打开 LX')
+    }
+    const readyDeadline = Date.now() + 6000
+    let ready = false
+    while (Date.now() < readyDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      if (await lxAvailable()) { ready = true; break }
+    }
+    if (!ready) throw new Error('LX 起来了，但开放 API 还没就绪（去 LX 设置里确认已启用开放 API）')
+  }
+
+  // ② 记下发之前的歌名，用来判断"到底换没换"
+  const before = await lxStatus().catch(() => null)
+
   const [name, ...rest] = text.split(/\s+/u)
   const singer = rest.join(' ')
   const target = singer === '' ? name : `${name}-${singer}`
@@ -131,21 +154,20 @@ export async function playByKeyword(keyword) {
   const opened = await openScheme(url)
   if (!opened) throw new Error('没能唤起 LX Music（确认它已安装并在运行）')
 
-  // 等它真的开始播：最多 8 秒，命中就返回真实状态
-  const deadline = Date.now() + 8000
+  const deadline = Date.now() + 4000
   while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 400))
-    try {
-      const status = await lxStatus()
-      if (status.status === 'playing' && status.title !== '') return status
-    } catch { /* LX 还没反应过来，继续等 */ }
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    const state = await lxStatus().catch(() => null)
+    if (state === null) continue
+    const titleChanged = state.title !== '' && state.title !== (before?.title ?? '')
+    const resumed = before !== null && before.status !== 'playing' && state.status === 'playing' && state.title !== ''
+    if (titleChanged || resumed) return { ...state, matched: true, requested: text }
   }
-  // 没等到也别报错：LX 可能弹了搜索结果让用户挑
-  try {
-    return await lxStatus()
-  } catch {
-    throw new Error('LX 没响应，点开 LX 看看是不是卡住了')
-  }
+
+  // ③ 超时：如实返回当前状态，别假装成功
+  const after = await lxStatus().catch(() => null)
+  if (after === null) throw new Error('LX 没响应，点开 LX 看看是不是卡住了')
+  return { ...after, matched: false, requested: text }
 }
 
 /** 按 LX 可执行文件路径启动（用户没开 LX 时尝试拉起） */
@@ -223,10 +245,18 @@ export async function runLx(args = {}) {
         return { text: '继续放', data: { ok: true, ...status } }
       }
       const status = await playByKeyword(keyword)
-      const title = status.title === '' ? keyword : `${status.title}${status.artist === '' ? '' : ` - ${status.artist}`}`
+      const title = `${status.title ?? ''}${status.artist === undefined || status.artist === '' ? '' : ` - ${status.artist}`}`
+      if (status.matched === true) {
+        return { text: `正在放：${title}`, data: { ok: true, ...status } }
+      }
+      /*
+       * 没换歌 = LX 大概率没搜到。
+       * 这时候别报"放上了"——用户会以为在放，实际还是上一首。
+       * 如实说，并把"可以不换歌名再试"的线索给模型。
+       */
       return {
-        text: status.status === 'playing' ? `正在放：${title}` : `已让 LX 搜索「${keyword}」，当前状态 ${status.rawStatus}${title === '' ? '' : `（${title}）`}`,
-        data: { ok: true, ...status },
+        text: `没搜到「${keyword}」：LX 里现在还是「${title === '' ? '没在放' : title}」。换个歌名、或把歌手一起说出来再试。`,
+        data: { ok: false, ...status },
       }
     }
     if (action === 'toggle') {
