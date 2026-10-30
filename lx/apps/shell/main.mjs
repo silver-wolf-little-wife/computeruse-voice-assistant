@@ -112,6 +112,7 @@ const isQuitTest = process.argv.includes('--quit-test')
 const isFollowUpUiTest = process.argv.includes('--followup-ui-test')
 const isCuaTest = process.argv.includes('--cua-test')
 const isFollowUpTest = process.argv.includes('--followup-test')
+const isMusicFollowUpTest = process.argv.includes('--music-followup-test')
 const isHistoryTest = process.argv.includes('--history-test')
 const searchTestIndex = process.argv.indexOf('--search-test')
 const isSearchTest = searchTestIndex !== -1
@@ -500,6 +501,9 @@ function onWake(keyword) {
   log(`wake: ${keyword}`)
   // 一次唤醒 = 一次会话：清掉上一件事的记忆，避免"新问题被老问题带偏"
   resetSession('wake')
+  // 新一轮从"没放过歌"开始（上一轮掐掉的待命不能带到这一轮）
+  suppressFollowUp = false
+  lastMusicAction = ''
   showForWake('listening')
   sendSubtitle({ reset: true, hint: '我在听，请说' })
 
@@ -910,6 +914,21 @@ let followUpConfig = { ...FOLLOWUP_DEFAULTS }
 let sessionHistory = []
 /** 回合结束时话还没播完：播完再判一次要不要待命 */
 let pendingFollowUpCheck = false
+/**
+ * 本轮放过歌（play/resume/next/prev 且真的成功了）→ 取消连续对话。
+ *
+ * 为什么：歌一开始放，用户下一句多半是"声音小点""换一首"，但也可能什么都不说——
+ * 而待命窗口会把麦克风继续挂在"等你说"的状态上，歌里的人声还会一直往识别里灌。
+ * 放歌是个明确的"去做事"动作，不是一个需要追问的对话，所以监听窗口本轮直接不开。
+ * 用户想接着指挥，喊一句「你好狼宝」即可。
+ */
+let suppressFollowUp = false
+/** 本轮最近一次音乐工具调用的 action（tool_end 事件里没有 args，只能先记下） */
+let lastMusicAction = ''
+/** 两个版本的音乐工具名：v0.2.0 是 music（LX），v0.1.0 是 netease_music */
+const MUSIC_TOOLS = new Set(['music', 'netease_music'])
+/** 哪些动作算"放歌"：真正让声音响起来 / 换歌的，查询类（state/lyric）不算 */
+const MUSIC_START_ACTIONS = new Set(['play', 'resume', 'next', 'prev'])
 /** 托盘"语音唤醒"菜单项：必须和真实麦克风状态一致，否则用户看到勾选却听不见/没勾却在听 */
 let wakeMenuItem = null
 /** 本轮用户说的话，写进审计日志用 */
@@ -1216,6 +1235,11 @@ async function startFollowUpIfWanted() {
   if (activeTurn !== null) return false  // 回合还没结束
   if (confirmResolver !== null) return false // 正在等确认，别抢
   if (commandActive) return false        // 已经在听了
+  // 这一轮已经放上歌了：不再开待命窗口，说完就收。想接着指挥喊唤醒词即可
+  if (suppressFollowUp) {
+    log('follow-up skipped: 本轮放过歌（music play ok）')
+    return false
+  }
 
   const judgement = await resolveFollowUpJudgement()
   if (judgement.wait !== true && judgement.confidence < followUpConfig.thresholds.low) {
@@ -1433,10 +1457,18 @@ function handleAgentEvent(event) {
       sendSubtitle({ hint: `正在${toolHint(event.name)}` })
     })
     log(`tool: ${event.name} ${JSON.stringify(event.args ?? {}).slice(0, 160)}`)
+    // 音乐工具的 action 先记下：tool_end 事件不带 args，等它成功返回时再判要不要掐掉待命
+    lastMusicAction = MUSIC_TOOLS.has(event.name) ? String(event.args?.action ?? '') : ''
     return
   }
   if (event.type === 'tool_end') {
     log(`tool ${event.name} ${event.ok ? 'ok' : 'fail'} ${event.ms ?? ''}ms${event.ok ? '' : ` ${String(event.text ?? '').slice(0, 160)}`}`)
+    if (event.ok === true && MUSIC_TOOLS.has(event.name) && MUSIC_START_ACTIONS.has(lastMusicAction)) {
+      // 只在真的放出声（工具返回 ok）后才取消待命：LX 没连上、搜不到歌时还得能接着说
+      suppressFollowUp = true
+      log(`music ${lastMusicAction} ok → 本轮不再开待命窗口`)
+      lastMusicAction = ''
+    }
   }
 }
 
@@ -1846,6 +1878,9 @@ async function runCommand(text) {
   lastUtterance = text
   deniedInTurn = {}
   wantContinue = false
+  // 每一轮重新判：上一轮放过歌，不该影响这一轮
+  suppressFollowUp = false
+  lastMusicAction = ''
   turnHistoryCounts.push(sessionHistory.length)
   log(`turn start history=${sessionHistory.length} "${text.slice(0, 40)}"`)
   // 设置页刚保存的搜索 key 要立刻生效，否则用户得重启才知道有没有配好
@@ -1918,7 +1953,7 @@ async function runCommand(text) {
           log(`follow-up window 按判定调整为 ${wanted}ms（已等 ${waited}ms，剩余 ${remaining}ms）`)
         }
       } else if (followUpWindowStart === 0 && !speechBusy() && judgement.wait === true && judgement.confidence >= followUpConfig.thresholds.high
-        && listening && !commandActive && activeTurn === null && confirmResolver === null) {
+        && listening && !commandActive && activeTurn === null && confirmResolver === null && !suppressFollowUp) {
         /*
          * 判定来晚了：窗口已经因为"启发式认为该收"而关闭，但模型说有把握该等。
          * 只要用户还没开始新的一轮，就把窗口补开——这是慢模型下唯一不浪费判定的做法。
@@ -2840,6 +2875,8 @@ if (!gotSingleInstanceLock) {
     await runHistoryTest()
   } else if (isFollowUpTest) {
     await runFollowUpTest()
+  } else if (isMusicFollowUpTest) {
+    await runMusicFollowUpTest()
   } else if (isGateTest) {
     await runGateTest(gateTestMode)
   } else if (isBargeInTest) {
@@ -3375,6 +3412,97 @@ async function runFollowUpTest() {
   console.log('__FOLLOWUP__' + JSON.stringify(report))
   await stopListening()
   setTimeout(() => { app.isQuitting = true; app.exit(0) }, 300)
+}
+
+/**
+ * 放歌后取消连续对话（--music-followup-test）。
+ *
+ * 不连模型、不开麦：直接喂 handleAgentEvent 构造"音乐工具成功/失败"的事件，
+ * 再看 startFollowUpIfWanted 开不开待命窗口。验的是判定分支本身，不是模型。
+ *
+ * 四个用例：
+ *   1. play 成功 → 不开窗口
+ *   2. play 失败（LX 没连上 / 搜不到）→ 照常开（用户还得接着说怎么办）
+ *   3. state（查询）成功 → 照常开（这不是"放歌"）
+ *   4. next 成功 → 不开窗口（换歌也算放歌）
+ */
+async function runMusicFollowUpTest() {
+  const results = []
+  const check = (name, pass, detail) => results.push({ name, pass, detail })
+
+  // 判定与窗口都靠这份假判定：不经模型，置信度拉满，只要能开就一定开
+  followUpJudgement = { wait: true, confidence: 0.95, source: 'test', why: 'test-harness' }
+  followUpJudgePromise = null
+  const savedContinuous = continuousMode
+  const savedListening = listening
+  continuousMode = true
+  listening = true
+
+  const makeTurn = () => {
+    activeTurn = { id: turnSeq, buffer: '', raw: '', state: 'thinking', tools: 0, startedAt: Date.now() }
+  }
+  const clearWindow = () => {
+    clearTimeout(commandTimer)
+    commandActive = false
+    followUpWindowStart = 0
+  }
+
+  /** 跑一个用例：给一串 agent 事件，返回待命窗口有没有开 */
+  const runCase = async (label, events) => {
+    suppressFollowUp = false
+    lastMusicAction = ''
+    clearWindow()
+    activeTurn = null
+    makeTurn()
+    for (const event of events) handleAgentEvent(event)
+    const suppressed = suppressFollowUp
+    activeTurn = null
+    const opened = await startFollowUpIfWanted()
+    clearWindow()
+    log(`music-followup case「${label}」suppressed=${suppressed} opened=${opened}`)
+    return { suppressed, opened }
+  }
+
+  const play = await runCase('play 成功', [
+    { type: 'tool_start', name: 'music', args: { action: 'play', keyword: '晴天 周杰伦' } },
+    { type: 'tool_end', name: 'music', ok: true, ms: 120 },
+  ])
+  check('play 成功 → 不开待命', play.suppressed === true && play.opened === false, `suppressed=${play.suppressed} opened=${play.opened}`)
+
+  const failed = await runCase('play 失败', [
+    { type: 'tool_start', name: 'music', args: { action: 'play', keyword: '晴天' } },
+    { type: 'tool_end', name: 'music', ok: false, text: '没搜到这首歌' },
+  ])
+  check('play 失败 → 照常待命', failed.suppressed === false && failed.opened === true, `suppressed=${failed.suppressed} opened=${failed.opened}`)
+
+  const query = await runCase('state 查询', [
+    { type: 'tool_start', name: 'music', args: { action: 'state' } },
+    { type: 'tool_end', name: 'music', ok: true, ms: 30 },
+  ])
+  check('state 查询 → 照常待命', query.suppressed === false && query.opened === true, `suppressed=${query.suppressed} opened=${query.opened}`)
+
+  const next = await runCase('next 换歌', [
+    { type: 'tool_start', name: 'music', args: { action: 'next' } },
+    { type: 'tool_end', name: 'music', ok: true, ms: 60 },
+  ])
+  check('next 成功 → 不开待命', next.suppressed === true && next.opened === false, `suppressed=${next.suppressed} opened=${next.opened}`)
+
+  const netease = await runCase('网易云 play 成功', [
+    { type: 'tool_start', name: 'netease_music', args: { action: 'play', keyword: '晴天' } },
+    { type: 'tool_end', name: 'netease_music', ok: true, ms: 900 },
+  ])
+  check('netease_music play 成功 → 不开待命', netease.suppressed === true && netease.opened === false, `suppressed=${netease.suppressed} opened=${netease.opened}`)
+
+  continuousMode = savedContinuous
+  listening = savedListening
+  suppressFollowUp = false
+  lastMusicAction = ''
+
+  const failedCases = results.filter((row) => !row.pass)
+  const report = { cases: results.length, failed: failedCases.length, rows: results, pass: failedCases.length === 0 }
+  log(`music-followup-test report ${JSON.stringify(report)}`)
+  console.log('__MUSICFOLLOWUP__' + JSON.stringify(report))
+  setTimeout(() => { app.isQuitting = true; app.exit(report.pass ? 0 : 1) }, 300)
 }
 
 /**
