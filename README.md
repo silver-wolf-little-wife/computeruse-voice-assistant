@@ -37,8 +37,8 @@
 ## 快速开始
 
 1. 从 [Releases](../../releases) 下载对应版本的安装包：
-   - `v0.2.0` → `语音助手-0.2.0-setup.exe`（LX 版，先装好 LX Music 并打开开放 API）
-   - `v0.1.0` → `语音助手-0.1.0-setup.exe`（网易云版，先装 ncm-cli + mpv）
+   - `v0.2.0` → `voice-assistant-0.2.0-setup.exe`（LX 版，先装好 LX Music 并打开开放 API）
+   - `v0.1.0` → `voice-assistant-0.1.0-setup.exe`（网易云版，先装 ncm-cli + mpv）
 2. 首次启动后打开托盘 → **设置**，填：
    - 模型 API Key（必需）
    - 联网搜索 Key（可选，Tavily）
@@ -48,24 +48,28 @@
 > 两个安装版都不含语音运行时（venv + 音色包约 5GB）。需要发声就把 `.runtime/` 放到安装目录的
 > `resources/` 下，或直接用完整版压缩包（见下）。
 
+
+> **为什么资产名是英文**：GitHub 会把 release 资产名里的中文字符剥掉（官方文档写明会 rename），
+> 所以下载文件名用 `voice-assistant-*`，解压后仍是中文名的免安装目录。
+
 ## 完整版（含语音）
 
 完整版体积 3.5GB，超过 GitHub 单文件 2GB 上限，因此拆成两个 7z 分卷放在各自 Release 里：
 
 ```text
 # LX 版（v0.2.0）
-语音助手-完整版-0.2.0.7z.001   1.76 GB
-语音助手-完整版-0.2.0.7z.002   1.20 GB
+voice-assistant-full-0.2.0.7z.001   1.76 GB
+voice-assistant-full-0.2.0.7z.002   1.20 GB
 
 # 网易云版（v0.1.0）
-语音助手-完整版-0.1.0.7z.001   1.76 GB
-语音助手-完整版-0.1.0.7z.002   1.20 GB
+voice-assistant-full-0.1.0.7z.001   1.76 GB
+voice-assistant-full-0.1.0.7z.002   1.20 GB
 ```
 
 合并解压（装好 7-Zip 后，只需指定第一个分卷）：
 
 ```powershell
-7z x 语音助手-完整版-0.2.0.7z.001    # 会自动读取 .002
+7z x voice-assistant-full-0.2.0.7z.001    # 会自动读取 .002
 ```
 
 解压出来是免安装目录，双击 `语音助手.exe` 即可。
