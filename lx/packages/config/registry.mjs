@@ -106,6 +106,14 @@ export function defaultConfig() {
       fullscreenRatio: 0.98,
       /** 可用内存低于多少 MB 时卸载 ASR（保留唤醒用的 KWS） */
       memoryFloorMb: 1200,
+      /**
+       * 显存让路：剩余低于 vramFloorMb 或占用 ≥ vramHighRatio → 关掉 TTS worker；
+       * 占用回落到 vramLowRatio 以下才恢复；让路最多持续 vramReleaseMaxMs（10 分钟）。
+       */
+      vramFloorMb: 800,
+      vramHighRatio: 0.85,
+      vramLowRatio: 0.6,
+      vramReleaseMaxMs: 600000,
       /** 多久探测一次 */
       pollMs: 20000,
     },

@@ -950,6 +950,14 @@ function playingAudio() {
 async function ensureTtsEngine() {
   if (ttsEngine !== null) return ttsEngine
   if (ttsLoading !== null) return ttsLoading
+  if (voiceSuspended) {
+    // 用户主动要语音了（托盘点了恢复、或某条路径明确要出声）：让路到此为止，托盘勾选同步取消
+    voiceSuspended = false
+    voiceSuspendedBy = ''
+    voiceSuspendedAt = 0
+    syncVoiceVramTray(false)
+    log('resource: 语音被主动使用，结束让路')
+  }
   ttsLoading = (async () => {
     const startedAt = Date.now()
     const { Tts } = await import('../../packages/voice/tts.mjs')
@@ -1134,10 +1142,11 @@ async function pumpSpeech() {
     for (;;) {
       fill()
       if (pending.length === 0) break
-      // 全屏时已经主动把 worker 关了：再把它叫起来就白让了，直接跳过出声（字幕照常）
+      // 已经主动把 worker 关了（全屏/显存/手动）：再把它叫起来就白让了，直接跳过出声（字幕照常）
       if (voiceSuspended) {
-        log('speech skipped: voice released for fullscreen')
-        sendSubtitle({ hint: '全屏中，语音已让出（退出全屏自动恢复）' })
+        const why = voiceSuspendedBy === 'vram' ? '显存紧张' : voiceSuspendedBy === 'manual' ? '你手动释放了语音显存' : '全屏中'
+        log(`speech skipped: voice released (${voiceSuspendedBy})`)
+        sendSubtitle({ hint: `语音已让出（${why}），恢复后自动出声` })
         ttsQueue.length = 0
         for (const item of pending) item.promise.catch(() => {})
         pending.length = 0
@@ -2044,15 +2053,76 @@ function feedCommandAudio(chunk) {
 // ---------------------------------------------------------------- 资源策略（R14）
 
 let resourceTimer = null
-/** TTS 是否因为全屏而被暂时关掉（恢复时据此重新预热） */
+/** TTS 是否被暂时停掉（全屏让路 / 显存让路 / 托盘手动释放），恢复时据此重新预热 */
 let voiceSuspended = false
+/** 让路原因：'fullscreen' | 'vram' | 'manual' —— 决定"满足什么条件才恢复" */
+let voiceSuspendedBy = ''
+/** 显存/手动让路从什么时候开始（全屏让路不计时，0 = 不计时） */
+let voiceSuspendedAt = 0
+/**
+ * 强制恢复过一次之后先"解除武装"：否则恢复 20 秒后又被让路，1.5GB 反复装卸。
+ * 等全屏结束且显存不再紧张，才重新允许自动让路。
+ */
+let voiceReleaseDisarmed = false
+/** 托盘里「释放语音显存」那一项：勾选状态必须和真实释放状态一致 */
+let voiceVramMenuItem = null
 let resourceConfig = null
 
 /**
- * 每 20 秒看一眼：前台是不是全屏应用、内存够不够，然后决定要不要让路。
+ * 停掉 TTS worker，把约 1.5GB 显存让出去。
+ * 唤醒、识别、操作电脑都不受影响，只是"开口"要重新加载（约 6.5 秒）。
+ */
+async function suspendVoice(cause, reason) {
+  if (reason !== undefined && reason !== '') log(`resource: ${reason}`)
+  voiceSuspended = true
+  voiceSuspendedBy = cause
+  voiceSuspendedAt = cause === 'fullscreen' ? 0 : Date.now()
+  const engine = ttsEngine
+  ttsEngine = null
+  try { if (engine !== null) await engine.dispose() } catch { /* 可能已退出 */ }
+  syncVoiceVramTray(true)
+  log(`resource: TTS worker 已停止（显存已释放，原因=${cause}）`)
+}
+
+/** 恢复语音：重新预热 worker（关掉播报时不折腾） */
+function resumeVoice(reason) {
+  voiceSuspended = false
+  voiceSuspendedBy = ''
+  voiceSuspendedAt = 0
+  syncVoiceVramTray(false)
+  log(`resource: ${reason}`)
+  if (!ttsEnabled) return
+  void ensureTtsEngine().catch((error) => log(`tts resume failed: ${error.message}`))
+}
+
+/**
+ * 托盘「释放语音显存」：勾上 = 立刻让出 1.5GB；取消 = 马上恢复。
+ * 手动恢复也会"解除武装"，避免 20 秒后又被策略收回。
+ */
+async function onVoiceVramToggled(release) {
+  if (release) {
+    if (voiceSuspended) return
+    await suspendVoice('manual', '托盘：手动释放语音显存')
+    return
+  }
+  voiceReleaseDisarmed = true
+  if (voiceSuspended) resumeVoice('托盘：手动恢复语音')
+}
+
+function syncVoiceVramTray(released) {
+  if (voiceVramMenuItem === null) return
+  if (voiceVramMenuItem.checked === released) return
+  voiceVramMenuItem.checked = released
+  log(`tray vram checkbox → ${released}`)
+}
+
+/**
+ * 每 20 秒看一眼：前台是不是全屏、显存/内存够不够，然后决定要不要让路、要不要收回来。
  *
- * 只做"可逆的让路"，而且**保留唤醒**：
- *   - 全屏 → 关 TTS worker，释放 1.5GB 显存；唤醒/识别/操作电脑全部照旧
+ * 只做"可逆的让路"，而且**保留唤醒**（以及 KWS 和 ASR）：
+ *   - 全屏 → 关 TTS worker，释放 1.5GB 显存；退出全屏自动恢复
+ *   - 显存吃紧（剩余 < 800MB 或占用 ≥ 85%）→ 同样关 TTS worker；显存回落到 60% 以下恢复
+ *     显存让路最长 10 分钟：用户不会记得去托盘取消，到点先恢复语音
  *   - 内存低于阈值 → 卸 ASR（240MB），KWS 仍在，唤醒后多等 6 秒加载识别
  * 正在对话/播报/等确认时一律不动——那是最不能卡的时候。
  */
@@ -2068,34 +2138,47 @@ async function runResourceTick(force) {
     if (resourceConfig === null) return
     if (resourceConfig.enabled === false) return
     const policy = await import('../../packages/system/resource-policy.mjs')
+    const { queryVram } = await import('../../packages/system/gpu.mjs')
     const busy = activeTurn !== null || commandActive || playingAudio() || ttsLoading !== null
     const fullscreen = force === 'fullscreen' ? true : await isForegroundFullscreen(policy)
     const freeMemMb = freemem() / 1048576
+    // 忙的时候反正不动，省掉一次 nvidia-smi 调用（约 40~100ms）
+    const vram = busy ? null : await queryVram()
+    const pressure = policy.vramPressure(vram, resourceConfig) === true
+
+    // ① 资源回落 → 重新允许自动让路
+    if (voiceReleaseDisarmed && !fullscreen && !pressure) {
+      voiceReleaseDisarmed = false
+      log('resource: 资源已回落，重新允许自动让路')
+    }
+
+    // ② 该恢复了？——按"当初为什么让路"分别判定；恢复完这一轮就结束，让下一轮再判要不要重新让路
+    if (voiceSuspended && !busy) {
+      const maxMs = Number(resourceConfig.vramReleaseMaxMs ?? 600000)
+      const timedOut = voiceSuspendedBy !== 'fullscreen' && voiceSuspendedAt > 0 && Date.now() - voiceSuspendedAt >= maxMs
+      if (timedOut) {
+        // 到点强制恢复：显存还紧张也不等了，先让助手能说话；之后要再让路得等资源回落
+        voiceReleaseDisarmed = true
+        resumeVoice(`让路已满 ${Math.round(maxMs / 60000)} 分钟，自动恢复语音`)
+      } else if (voiceSuspendedBy === 'fullscreen' && !fullscreen) {
+        resumeVoice('全屏结束，重新预热语音')
+      } else if (voiceSuspendedBy === 'vram' && !pressure) {
+        resumeVoice('显存已回落，重新预热语音')
+      }
+      return
+    }
+
     const decision = policy.decide({
       fullscreen,
       freeMemMb,
       voiceLoaded: ttsEngine !== null,
       asrLoaded: asr !== null,
       busy,
+      vram,
     }, resourceConfig)
 
-    if (!decision.releaseVoice && !decision.releaseAsr) {
-      // 全屏结束 → 把刚才让出去的语音收回来
-      if (voiceSuspended && !fullscreen && !busy && ttsEnabled) {
-        voiceSuspended = false
-        log('resource: 全屏结束，重新预热语音')
-        void ensureTtsEngine().catch((error) => log(`tts resume failed: ${error.message}`))
-      }
-      return
-    }
-
-    if (decision.releaseVoice && releaseOnFullscreen) {
-      log(`resource: ${decision.reason}`)
-      voiceSuspended = true
-      const engine = ttsEngine
-      ttsEngine = null
-      try { if (engine !== null) await engine.dispose() } catch { /* 可能已退出 */ }
-      log('resource: TTS worker 已停止（显存已释放）')
+    if (decision.releaseVoice && releaseOnFullscreen && !voiceReleaseDisarmed) {
+      await suspendVoice(decision.vramForced ? 'vram' : 'fullscreen', decision.reason)
     }
     if (decision.releaseAsr) {
       log(`resource: ${decision.reason}`)
@@ -2641,6 +2724,9 @@ function buildTray() {
       void saveUiPrefs()
       log(`ttsEnabled=${ttsEnabled}`)
     } },
+    { id: 'voiceVram', label: '释放语音显存（省 1.5GB）', type: 'checkbox', checked: false, click: (item) => {
+      void onVoiceVramToggled(item.checked)
+    } },
     { label: '语音确认', type: 'checkbox', checked: voiceConfirmEnabled, click: (item) => {
       voiceConfirmEnabled = item.checked
       void saveUiPrefs()
@@ -2699,6 +2785,7 @@ function buildTray() {
   ])
   tray.setContextMenu(menu)
   wakeMenuItem = menu.getMenuItemById('wake')
+  voiceVramMenuItem = menu.getMenuItemById('voiceVram')
 
   /*
    * 托盘建好之后，把"当前真实状态"补同步一次。
@@ -3815,11 +3902,33 @@ async function runResourceTest() {
   await sleep(1500)
   report.steps.push({ step: 'restored', voiceEngine: ttsEngine !== null, suspended: voiceSuspended })
 
+  // 4) 托盘手动释放 / 手动恢复
+  await onVoiceVramToggled(true)
+  report.steps.push({ step: 'manual-release', voice: ttsEngine !== null, suspended: voiceSuspended, cause: voiceSuspendedBy })
+  await onVoiceVramToggled(false)
+  await sleep(300)
+  report.steps.push({ step: 'manual-resume', suspended: voiceSuspended, disarmed: voiceReleaseDisarmed })
+
+  // 5) 显存让路到点自动恢复：把"10 分钟"压成 800ms 来验
+  //    先等上一段的 TTS 预热真正结束——预热中 busy=true，tick 会按设计"一律不动"
+  await ensureTtsEngine()
+  const savedMaxMs = resourceConfig.vramReleaseMaxMs
+  resourceConfig.vramReleaseMaxMs = 800
+  voiceReleaseDisarmed = false
+  await suspendVoice('vram', 'test: 模拟显存让路')
+  await sleep(1000)
+  await runResourceTick()
+  report.steps.push({ step: 'vram-timeout', suspended: voiceSuspended, disarmed: voiceReleaseDisarmed })
+  resourceConfig.vramReleaseMaxMs = savedMaxMs
+
   report.verdict = {
     hadModels: before.asr === true && before.voice === true,
     releasedVoice: report.steps[1].voice === false && report.steps[1].suspended === true,
     keptAsr: report.steps[1].asr === true,
     resumeAttempted: report.steps[2].suspended === false,
+    manualReleased: report.steps[3].suspended === true && report.steps[3].voice === false,
+    manualResumed: report.steps[4].suspended === false,
+    vramTimeoutResumed: report.steps[5].suspended === false,
   }
   report.pass = Object.values(report.verdict).every((value) => value === true)
 

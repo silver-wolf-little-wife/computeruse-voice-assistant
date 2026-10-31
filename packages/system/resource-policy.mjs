@@ -21,6 +21,45 @@ export const RESOURCE_DEFAULTS = {
   /** 全屏判定额外要求：窗口高度接近屏幕高度（防止横向铺满但只占一半的情况） */
   minHeightRatio: 0.95,
   pollMs: 20000,
+  /**
+   * 显存剩余低于这个 MB 就让出 TTS。
+   *
+   * 为什么要显存阈值：8GB 卡上 TTS worker 常驻 1.5GB，打游戏时它是纯占用；
+   * 而"全屏"这一条抓不住窗口化/无边框窗口的游戏（星铁窗口 1295x757 只占 54% 屏幕）。
+   * 800MB 在 8GB 卡上约等于剩余 10%，再往下游戏就开始掉帧。
+   */
+  vramFloorMb: 800,
+  /** 显存占用高于这个比例也让出（大显存卡上 vramFloorMb 可能永远不触发） */
+  vramHighRatio: 0.85,
+  /** 占用回到这个比例以下才算"不紧张"，才恢复语音（留回差，避免来回抖） */
+  vramLowRatio: 0.6,
+  /**
+   * 显存触发的让路最多持续这么久，到点自动恢复语音。
+   *
+   * 用户不会记得去托盘取消；显存被别的程序长期占着（游戏/OBS/本地模型）时，
+   * 语音就永久哑了。10 分钟后先恢复，真紧张的话等显存回落再重新让路。
+   */
+  vramReleaseMaxMs: 10 * 60 * 1000,
+}
+
+/** 显存占用比例；没有数据返回 null */
+export function vramRatio(vram) {
+  const total = Number(vram?.totalMb)
+  const used = Number(vram?.usedMb)
+  if (!Number.isFinite(total) || !Number.isFinite(used) || total <= 0 || used < 0) return null
+  return Math.min(1, used / total)
+}
+
+/**
+ * 显存紧不紧张。
+ * @returns {boolean|null} null = 没有显存数据（不是 N 卡，或读不到），当不紧张处理
+ */
+export function vramPressure(vram, options = {}) {
+  const cfg = { ...RESOURCE_DEFAULTS, ...options }
+  const ratio = vramRatio(vram)
+  if (ratio === null) return null
+  const freeMb = Number(vram.totalMb) - Number(vram.usedMb)
+  return ratio >= cfg.vramHighRatio || freeMb < cfg.vramFloorMb
 }
 
 /**
@@ -60,23 +99,35 @@ export function isFullscreen(info, options = {}) {
 
 /**
  * 决策。
- * @param {{fullscreen:boolean, freeMemMb:number, voiceLoaded:boolean, asrLoaded:boolean, busy:boolean}} state
+ * @param {{fullscreen:boolean, freeMemMb:number, voiceLoaded:boolean, asrLoaded:boolean, busy:boolean, vram:({totalMb:number,usedMb:number}|null)}} state
  *   busy = 正在对话/播报/等确认 —— 这时候一律不动
- * @returns {{releaseVoice:boolean, releaseAsr:boolean, reason:string}}
+ * @returns {{releaseVoice:boolean, releaseAsr:boolean, vramPressure:boolean|null, vramForced:boolean, reason:string}}
+ *   vramForced = 这次让路是显存触发的（不是全屏），决定"什么时候恢复"和"10 分钟到点恢复"用
  */
 export function decide(state, options = {}) {
   const cfg = { ...RESOURCE_DEFAULTS, ...options }
-  const { fullscreen = false, freeMemMb = Infinity, voiceLoaded = false, asrLoaded = false, busy = false } = state ?? {}
+  const { fullscreen = false, freeMemMb = Infinity, voiceLoaded = false, asrLoaded = false, busy = false, vram = null } = state ?? {}
+  const pressure = vramPressure(vram, cfg) === true
+  const ratio = vramRatio(vram)
 
-  if (busy) return { releaseVoice: false, releaseAsr: false, reason: 'busy' }
+  if (busy) return { releaseVoice: false, releaseAsr: false, vramPressure: pressure, vramForced: false, reason: 'busy' }
 
-  const needsVoiceRelease = fullscreen && voiceLoaded
+  const needsVoiceRelease = (fullscreen || pressure) && voiceLoaded
   const needsAsrRelease = freeMemMb < cfg.memoryFloorMb && asrLoaded
   if (!needsVoiceRelease && !needsAsrRelease) {
-    return { releaseVoice: false, releaseAsr: false, reason: 'ok' }
+    return { releaseVoice: false, releaseAsr: false, vramPressure: pressure, vramForced: false, reason: 'ok' }
   }
   const parts = []
-  if (needsVoiceRelease) parts.push('全屏应用占满屏幕 → 释放 TTS 显存')
+  if (fullscreen && voiceLoaded) parts.push('全屏应用占满屏幕 → 释放 TTS 显存')
+  if (pressure && voiceLoaded && !fullscreen) {
+    parts.push(`显存 ${Math.round(vram.usedMb)}/${Math.round(vram.totalMb)}MB（${Math.round((ratio ?? 0) * 100)}%）吃紧 → 释放 TTS 显存`)
+  }
   if (needsAsrRelease) parts.push(`可用内存 ${Math.round(freeMemMb)}MB < ${cfg.memoryFloorMb}MB → 卸载 ASR（保留唤醒）`)
-  return { releaseVoice: needsVoiceRelease, releaseAsr: needsAsrRelease, reason: parts.join('；') }
+  return {
+    releaseVoice: needsVoiceRelease,
+    releaseAsr: needsAsrRelease,
+    vramPressure: pressure,
+    vramForced: needsVoiceRelease && !fullscreen,
+    reason: parts.join('；'),
+  }
 }

@@ -106,6 +106,14 @@ export function defaultConfig() {
       fullscreenRatio: 0.98,
       /** 可用内存低于多少 MB 时卸载 ASR（保留唤醒用的 KWS） */
       memoryFloorMb: 1200,
+      /**
+       * 显存让路：剩余低于 vramFloorMb 或占用 ≥ vramHighRatio → 关掉 TTS worker；
+       * 占用回落到 vramLowRatio 以下才恢复；让路最多持续 vramReleaseMaxMs（10 分钟）。
+       */
+      vramFloorMb: 800,
+      vramHighRatio: 0.85,
+      vramLowRatio: 0.6,
+      vramReleaseMaxMs: 600000,
       /** 多久探测一次 */
       pollMs: 20000,
     },
@@ -125,12 +133,6 @@ export function defaultConfig() {
     modelProfiles: [],    modelSchedule: {
       enabled: false,
       rules: [],
-    },    /** 网易云音乐：appId + RSA privateKey（ncm-cli 用它们做签名） */
-    netease: {
-      appId: '',
-      privateKey: '',
-      // 上次同步给 ncm-cli 的凭据哈希：没变就不重写，避免把登录态顶掉
-      syncedHash: '',
     },
     followup: {
       thresholds: { high: 0.7, low: 0.3 },

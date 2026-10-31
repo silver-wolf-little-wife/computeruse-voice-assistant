@@ -10,7 +10,8 @@
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 
-import { coverageRatio, isFullscreen, decide, RESOURCE_DEFAULTS } from '../packages/system/resource-policy.mjs'
+import { coverageRatio, isFullscreen, decide, RESOURCE_DEFAULTS, vramRatio, vramPressure } from '../packages/system/resource-policy.mjs'
+import { parseVram } from '../packages/system/gpu.mjs'
 
 const results = []
 function check(name, pass, detail) {
@@ -43,6 +44,33 @@ check('决策：内存低 → 只卸 ASR',
   (() => { const d = decide({ fullscreen: false, freeMemMb: 600, voiceLoaded: true, asrLoaded: true }); return !d.releaseVoice && d.releaseAsr })(), '')
 check('决策：都没加载 → 无动作', decide({ fullscreen: true, freeMemMb: 300, voiceLoaded: false, asrLoaded: false }).reason === 'ok', '')
 check('决策：内存阈值可配', decide({ freeMemMb: 1500, asrLoaded: true }, { memoryFloorMb: 2000 }).releaseAsr === true, '')
+
+// ---- 显存阈值（8GB 卡上 TTS 常驻 1.5GB）
+check('显存：比例计算', Math.abs(vramRatio({ totalMb: 8000, usedMb: 6000 }) - 0.75) < 1e-9, '')
+check('显存：没有数据 → null', vramRatio(null) === null && vramPressure(null) === null, '')
+check('显存：占用 90% → 紧张', vramPressure({ totalMb: 8151, usedMb: 7335 }) === true, '90%')
+check('显存：剩 500MB → 紧张', vramPressure({ totalMb: 16000, usedMb: 15500 }) === true, '剩 500MB')
+check('显存：占用 50% → 不紧张', vramPressure({ totalMb: 8000, usedMb: 4000 }) === false, '50%')
+check('显存：阈值可配', vramPressure({ totalMb: 8000, usedMb: 4000 }, { vramHighRatio: 0.4 }) === true, '')
+check('决策：显存紧张 → 只为语音让路',
+  (() => {
+    const d = decide({ fullscreen: false, freeMemMb: 8000, voiceLoaded: true, vram: { totalMb: 8000, usedMb: 7200 } })
+    return d.releaseVoice === true && d.vramForced === true && d.vramPressure === true && d.releaseAsr === false
+  })(), '')
+check('决策：显存紧张但语音没加载 → 不动',
+  decide({ fullscreen: false, voiceLoaded: false, vram: { totalMb: 8000, usedMb: 7200 } }).releaseVoice === false, '')
+check('决策：显存不紧张 → 不释放',
+  decide({ fullscreen: false, voiceLoaded: true, vram: { totalMb: 8000, usedMb: 4000 } }).releaseVoice === false, '')
+// 全屏 + 显存同时紧张时算"全屏"触发：恢复条件是退出全屏，不是显存回落（否则游戏里永远恢复不了）
+check('决策：全屏+显存 → 按全屏触发',
+  (() => {
+    const d = decide({ fullscreen: true, voiceLoaded: true, vram: { totalMb: 8000, usedMb: 7200 } })
+    return d.releaseVoice === true && d.vramForced === false
+  })(), '')
+check('parseVram：单卡', JSON.stringify(parseVram('8151, 7335')) === '{"totalMb":8151,"usedMb":7335}', '')
+check('parseVram：多卡取最大的', parseVram('2048, 100\n8151, 7000').totalMb === 8151, '')
+check('parseVram：脏数据 → null', parseVram('nonsense\n') === null, '')
+check('parseVram：used 超过 total 会被夹住', parseVram('1000, 1200').usedMb === 1000, '')
 
 // 真实探测
 const script = join(process.cwd(), 'packages', 'system', 'foreground.ps1')
