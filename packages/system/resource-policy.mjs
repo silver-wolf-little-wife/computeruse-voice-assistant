@@ -131,3 +131,36 @@ export function decide(state, options = {}) {
     reason: parts.join('；'),
   }
 }
+
+/**
+ * 已经让路之后，下一步该干什么（纯函数，便于验收）。
+ *
+ * 为什么不能"不紧张就恢复"：TTS worker 自己就要 1.5GB。显存 74% 时恢复，
+ * 加载完立刻顶到 92%，20 秒后又被让路——1.5GB 反复装卸，比一直占着更糟。
+ * 所以显存让路必须等占用真的回到低水位（vramLowRatio）才恢复。
+ *
+ * @param {{cause:'fullscreen'|'vram'|'manual'|'', fullscreen:boolean, pressure:boolean|null, ratio:number|null,
+ *          suspendedAt:number, nowMs:number, busy:boolean}} state
+ * @returns {{action:'resume'|'stay'|'switch-vram', timedOut:boolean}}
+ */
+export function nextVoiceAction(state, options = {}) {
+  const cfg = { ...RESOURCE_DEFAULTS, ...options }
+  const {
+    cause = '', fullscreen = false, pressure = null, ratio = null,
+    suspendedAt = 0, nowMs = Date.now(), busy = false,
+  } = state ?? {}
+
+  if (busy) return { action: 'stay', timedOut: false }
+  const timedOut = cause !== 'fullscreen' && suspendedAt > 0 && nowMs - suspendedAt >= cfg.vramReleaseMaxMs
+  if (timedOut) return { action: 'resume', timedOut: true }
+  // 手动释放只认"到点恢复"或用户自己取消，不跟着显存回落自动恢复
+  if (cause === 'manual') return { action: 'stay', timedOut: false }
+  if (cause === 'fullscreen') {
+    if (fullscreen) return { action: 'stay', timedOut: false }
+    // 退出全屏但显存还紧：先别预热，转成"显存让路"，等回落或 10 分钟到点
+    return { action: pressure === true ? 'switch-vram' : 'resume', timedOut: false }
+  }
+  if (pressure !== false) return { action: 'stay', timedOut: false }
+  if (ratio === null) return { action: 'resume', timedOut: false }
+  return { action: ratio <= cfg.vramLowRatio ? 'resume' : 'stay', timedOut: false }
+}

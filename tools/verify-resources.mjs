@@ -10,7 +10,7 @@
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 
-import { coverageRatio, isFullscreen, decide, RESOURCE_DEFAULTS, vramRatio, vramPressure } from '../packages/system/resource-policy.mjs'
+import { coverageRatio, isFullscreen, decide, RESOURCE_DEFAULTS, vramRatio, vramPressure, nextVoiceAction } from '../packages/system/resource-policy.mjs'
 import { parseVram } from '../packages/system/gpu.mjs'
 
 const results = []
@@ -71,6 +71,25 @@ check('parseVram：单卡', JSON.stringify(parseVram('8151, 7335')) === '{"total
 check('parseVram：多卡取最大的', parseVram('2048, 100\n8151, 7000').totalMb === 8151, '')
 check('parseVram：脏数据 → null', parseVram('nonsense\n') === null, '')
 check('parseVram：used 超过 total 会被夹住', parseVram('1000, 1200').usedMb === 1000, '')
+
+// ---- 让路之后的恢复判定（防抖：TTS 自己就要 1.5GB，74% 时恢复会立刻顶到 92%）
+const gate = { suspendedAt: 1000, nowMs: 5000, busy: false }
+check('恢复：忙的时候一律不动', nextVoiceAction({ ...gate, cause: 'vram', pressure: false, ratio: 0.3, busy: true }).action === 'stay', '')
+check('恢复：全屏结束 → 恢复', nextVoiceAction({ ...gate, cause: 'fullscreen', fullscreen: false, pressure: false }).action === 'resume', '')
+check('恢复：全屏结束但显存紧 → 转显存让路',
+  nextVoiceAction({ ...gate, cause: 'fullscreen', fullscreen: false, pressure: true }).action === 'switch-vram', '')
+check('恢复：显存回落到 50% → 恢复', nextVoiceAction({ ...gate, cause: 'vram', pressure: false, ratio: 0.5 }).action === 'resume', '')
+check('恢复：显存 74% 不恢复（防抖）', nextVoiceAction({ ...gate, cause: 'vram', pressure: false, ratio: 0.74 }).action === 'stay', '')
+check('恢复：手动释放不跟显存回落', nextVoiceAction({ ...gate, cause: 'manual', pressure: false, ratio: 0.2 }).action === 'stay', '')
+check('恢复：让路满 10 分钟 → 恢复', (() => {
+  const r = nextVoiceAction({ cause: 'vram', pressure: true, ratio: 0.9, suspendedAt: 1000, nowMs: 1000 + 600000 })
+  return r.action === 'resume' && r.timedOut === true
+})(), '')
+check('恢复：全屏让路不计时（只认退出全屏）',
+  nextVoiceAction({ cause: 'fullscreen', fullscreen: true, suspendedAt: 1000, nowMs: 1000 + 3600000 }).action === 'stay', '')
+check('恢复：手动让路到点也恢复', nextVoiceAction({ cause: 'manual', suspendedAt: 1000, nowMs: 1000 + 600000 }).action === 'resume', '')
+check('恢复：时长阈值可配',
+  nextVoiceAction({ cause: 'vram', pressure: true, ratio: 0.9, suspendedAt: 1000, nowMs: 2000 }, { vramReleaseMaxMs: 500 }).action === 'resume', '')
 
 // 真实探测
 const script = join(process.cwd(), 'packages', 'system', 'foreground.ps1')

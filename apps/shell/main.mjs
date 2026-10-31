@@ -2321,18 +2321,33 @@ async function runResourceTick(force) {
       log('resource: 资源已回落，重新允许自动让路')
     }
 
-    // ② 该恢复了？——按"当初为什么让路"分别判定；恢复完这一轮就结束，让下一轮再判要不要重新让路
-    if (voiceSuspended && !busy) {
-      const maxMs = Number(resourceConfig.vramReleaseMaxMs ?? 600000)
-      const timedOut = voiceSuspendedBy !== 'fullscreen' && voiceSuspendedAt > 0 && Date.now() - voiceSuspendedAt >= maxMs
-      if (timedOut) {
-        // 到点强制恢复：显存还紧张也不等了，先让助手能说话；之后要再让路得等资源回落
-        voiceReleaseDisarmed = true
-        resumeVoice(`让路已满 ${Math.round(maxMs / 60000)} 分钟，自动恢复语音`)
-      } else if (voiceSuspendedBy === 'fullscreen' && !fullscreen) {
-        resumeVoice('全屏结束，重新预热语音')
-      } else if (voiceSuspendedBy === 'vram' && !pressure) {
-        resumeVoice('显存已回落，重新预热语音')
+    // ② 已经让路了：按"当初为什么让路"决定恢复条件，恢复完这一轮就结束
+    if (voiceSuspended) {
+      const next = policy.nextVoiceAction({
+        cause: voiceSuspendedBy,
+        fullscreen,
+        pressure,
+        ratio: policy.vramRatio(vram),
+        suspendedAt: voiceSuspendedAt,
+        nowMs: Date.now(),
+        busy,
+      }, resourceConfig)
+      if (next.action === 'switch-vram') {
+        // 退出全屏了但显存还紧：继续让路——现在预热的话，装载完立刻又得让出去
+        voiceSuspendedBy = 'vram'
+        voiceSuspendedAt = Date.now()
+        log('resource: 已退出全屏但显存仍紧张，转显存让路（10 分钟后自动恢复）')
+      } else if (next.action === 'resume') {
+        const maxMs = Number(resourceConfig.vramReleaseMaxMs ?? 600000)
+        if (next.timedOut) {
+          // 到点强制恢复：显存还紧张也不等了，先让助手能说话；之后要再让路得等资源回落
+          voiceReleaseDisarmed = true
+          resumeVoice(`让路已满 ${Math.round(maxMs / 60000)} 分钟，自动恢复语音`)
+        } else if (voiceSuspendedBy === 'fullscreen') {
+          resumeVoice('全屏结束，重新预热语音')
+        } else {
+          resumeVoice('显存已回落，重新预热语音')
+        }
       }
       return
     }
