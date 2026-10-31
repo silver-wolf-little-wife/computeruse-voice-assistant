@@ -10,7 +10,7 @@
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 
-import { coverageRatio, isFullscreen, decide, RESOURCE_DEFAULTS, vramRatio, vramPressure, nextVoiceAction } from '../packages/system/resource-policy.mjs'
+import { coverageRatio, isFullscreen, decide, RESOURCE_DEFAULTS, vramRatio, vramPressure, nextVoiceAction, canAutoRelease } from '../packages/system/resource-policy.mjs'
 import { parseVram } from '../packages/system/gpu.mjs'
 
 const results = []
@@ -90,6 +90,12 @@ check('恢复：全屏让路不计时（只认退出全屏）',
 check('恢复：手动让路到点也恢复', nextVoiceAction({ cause: 'manual', suspendedAt: 1000, nowMs: 1000 + 600000 }).action === 'resume', '')
 check('恢复：时长阈值可配',
   nextVoiceAction({ cause: 'vram', pressure: true, ratio: 0.9, suspendedAt: 1000, nowMs: 2000 }, { vramReleaseMaxMs: 500 }).action === 'resume', '')
+
+// ---- 强制恢复之后，什么时候重新允许自动让路（必须和恢复条件同一把尺子）
+check('重新武装：显存 90% → 不解除', canAutoRelease({ fullscreen: false, pressure: false, ratio: 0.9 }) === false, '')
+check('重新武装：显存 50% → 解除', canAutoRelease({ fullscreen: false, pressure: false, ratio: 0.5 }) === true, '')
+check('重新武装：还在全屏 → 不解除', canAutoRelease({ fullscreen: true, pressure: false, ratio: 0.2 }) === false, '')
+check('重新武装：没有显存数据 → 解除', canAutoRelease({ fullscreen: false, pressure: null, ratio: null }) === true, '')
 
 // 真实探测
 const script = join(process.cwd(), 'packages', 'system', 'foreground.ps1')

@@ -2315,8 +2315,9 @@ async function runResourceTick(force) {
     const vram = busy ? null : await queryVram()
     const pressure = policy.vramPressure(vram, resourceConfig) === true
 
-    // ① 资源回落 → 重新允许自动让路
-    if (voiceReleaseDisarmed && !fullscreen && !pressure) {
+    // ① 资源真的回落到低水位 → 重新允许自动让路（和"恢复条件"用同一把尺子）
+    const ratio = policy.vramRatio(vram)
+    if (voiceReleaseDisarmed && policy.canAutoRelease({ fullscreen, pressure, ratio }, resourceConfig)) {
       voiceReleaseDisarmed = false
       log('resource: 资源已回落，重新允许自动让路')
     }
@@ -2327,7 +2328,7 @@ async function runResourceTick(force) {
         cause: voiceSuspendedBy,
         fullscreen,
         pressure,
-        ratio: policy.vramRatio(vram),
+        ratio,
         suspendedAt: voiceSuspendedAt,
         nowMs: Date.now(),
         busy,

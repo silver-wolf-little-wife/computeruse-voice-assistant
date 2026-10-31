@@ -133,6 +133,22 @@ export function decide(state, options = {}) {
 }
 
 /**
+ * 强制恢复之后，什么时候重新允许自动让路。
+ *
+ * 必须和"恢复条件"用同一把尺子（占用回到 vramLowRatio 以下），否则会这样：
+ * 10 分钟到点恢复 → TTS 加载中显存还没顶上去 → 下一轮判定"不紧张"就解除武装 →
+ * TTS 一加载完 90%，马上又被收回，恢复等于没恢复。
+ */
+export function canAutoRelease(state, options = {}) {
+  const cfg = { ...RESOURCE_DEFAULTS, ...options }
+  const { fullscreen = false, pressure = null, ratio = null } = state ?? {}
+  if (fullscreen) return false
+  if (pressure === true) return false
+  if (ratio === null) return true
+  return ratio <= cfg.vramLowRatio
+}
+
+/**
  * 已经让路之后，下一步该干什么（纯函数，便于验收）。
  *
  * 为什么不能"不紧张就恢复"：TTS worker 自己就要 1.5GB。显存 74% 时恢复，
