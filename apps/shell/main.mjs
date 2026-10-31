@@ -506,6 +506,7 @@ function onWake(keyword) {
   // 新一轮从"没放过歌"开始（上一轮掐掉的待命不能带到这一轮）
   suppressFollowUp = false
   lastMusicAction = ''
+  lastMusicOk = null
   showForWake('listening')
   sendSubtitle({ reset: true, hint: '我在听，请说' })
 
@@ -927,6 +928,12 @@ let pendingFollowUpCheck = false
 let suppressFollowUp = false
 /** 本轮最近一次音乐工具调用的 action（tool_end 事件里没有 args，只能先记下） */
 let lastMusicAction = ''
+/**
+ * 本轮最近一次音乐工具调用自己报的成败。
+ * tool_end 的 ok 只代表"没抛异常"，工具内部判定的失败（没搜到、放错歌手）在 data.ok 里，
+ * 两者要对齐，否则搜不到歌也会把待命窗口掐掉。
+ */
+let lastMusicOk = null
 /** 两个版本的音乐工具名：v0.2.0 是 music（LX），v0.1.0 是 netease_music */
 const MUSIC_TOOLS = new Set(['music', 'netease_music'])
 /** 哪些动作算"放歌"：真正让声音响起来 / 换歌的，查询类（state/lyric）不算 */
@@ -1460,12 +1467,17 @@ function handleAgentEvent(event) {
     })
     log(`tool: ${event.name} ${JSON.stringify(event.args ?? {}).slice(0, 160)}`)
     // 音乐工具的 action 先记下：tool_end 事件不带 args，等它成功返回时再判要不要掐掉待命
-    lastMusicAction = MUSIC_TOOLS.has(event.name) ? String(event.args?.action ?? '') : ''
+    if (MUSIC_TOOLS.has(event.name)) {
+      lastMusicAction = String(event.args?.action ?? '')
+      lastMusicOk = null
+    } else {
+      lastMusicAction = ''
+    }
     return
   }
   if (event.type === 'tool_end') {
     log(`tool ${event.name} ${event.ok ? 'ok' : 'fail'} ${event.ms ?? ''}ms${event.ok ? '' : ` ${String(event.text ?? '').slice(0, 160)}`}`)
-    if (event.ok === true && MUSIC_TOOLS.has(event.name) && MUSIC_START_ACTIONS.has(lastMusicAction)) {
+    if (event.ok === true && lastMusicOk !== false && MUSIC_TOOLS.has(event.name) && MUSIC_START_ACTIONS.has(lastMusicAction)) {
       // 只在真的放出声（工具返回 ok）后才取消待命：LX 没连上、搜不到歌时还得能接着说
       suppressFollowUp = true
       log(`music ${lastMusicAction} ok → 本轮不再开待命窗口`)
@@ -1840,6 +1852,8 @@ async function ensureAgent() {
             const login = await runNetease({ action: 'login' })
             musicResult.text = `${musicResult.text}\n登录链接：${login.text}`
           }
+          // tool_end 的 ok 只看"抛没抛异常"，工具自己判定的失败要单独交给待命逻辑
+          lastMusicOk = musicResult?.data?.ok === true
           return musicResult
         }
 
@@ -2050,6 +2064,7 @@ async function runCommand(text) {
   // 每一轮重新判：上一轮放过歌，不该影响这一轮
   suppressFollowUp = false
   lastMusicAction = ''
+  lastMusicOk = null
   turnHistoryCounts.push(sessionHistory.length)
   log(`turn start history=${sessionHistory.length} "${text.slice(0, 40)}"`)
   // 设置页刚保存的搜索 key 要立刻生效，否则用户得重启才知道有没有配好
@@ -3665,13 +3680,18 @@ async function runMusicFollowUpTest() {
   }
 
   /** 跑一个用例：给一串 agent 事件，返回待命窗口有没有开 */
-  const runCase = async (label, events) => {
+  const runCase = async (label, events, opts = {}) => {
     suppressFollowUp = false
     lastMusicAction = ''
+    lastMusicOk = null
     clearWindow()
     activeTurn = null
     makeTurn()
-    for (const event of events) handleAgentEvent(event)
+    for (const event of events) {
+      // 真机上 data.ok 是 invoke 返回前写进 lastMusicOk 的，这里在 tool_end 之前补同一个动作
+      if (event.type === 'tool_end' && opts.lastMusicOk !== undefined) lastMusicOk = opts.lastMusicOk
+      handleAgentEvent(event)
+    }
     const suppressed = suppressFollowUp
     activeTurn = null
     const opened = await startFollowUpIfWanted()
@@ -3681,16 +3701,23 @@ async function runMusicFollowUpTest() {
   }
 
   const play = await runCase('play 成功', [
-    { type: 'tool_start', name: 'music', args: { action: 'play', keyword: '晴天 周杰伦' } },
+    { type: 'tool_start', name: 'music', args: { action: 'play', name: '晴天', singer: '周杰伦' } },
     { type: 'tool_end', name: 'music', ok: true, ms: 120 },
   ])
   check('play 成功 → 不开待命', play.suppressed === true && play.opened === false, `suppressed=${play.suppressed} opened=${play.opened}`)
 
   const failed = await runCase('play 失败', [
-    { type: 'tool_start', name: 'music', args: { action: 'play', keyword: '晴天' } },
+    { type: 'tool_start', name: 'music', args: { action: 'play', name: '晴天' } },
     { type: 'tool_end', name: 'music', ok: false, text: '没搜到这首歌' },
   ])
   check('play 失败 → 照常待命', failed.suppressed === false && failed.opened === true, `suppressed=${failed.suppressed} opened=${failed.opened}`)
+
+  // 工具"跑完了"但自己判失败（搜到的是别人的版本）：data.ok=false，不该掐掉待命
+  const wrongArtist = await runCase('play 放错歌手', [
+    { type: 'tool_start', name: 'music', args: { action: 'play', name: '晴天', singer: '周杰伦' } },
+    { type: 'tool_end', name: 'music', ok: true, ms: 900 },
+  ], { lastMusicOk: false })
+  check('放错歌手 → 照常待命', wrongArtist.suppressed === false && wrongArtist.opened === true, `suppressed=${wrongArtist.suppressed} opened=${wrongArtist.opened}`)
 
   const query = await runCase('state 查询', [
     { type: 'tool_start', name: 'music', args: { action: 'state' } },
